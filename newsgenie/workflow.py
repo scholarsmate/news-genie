@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
+import time
+import uuid
 from typing import Any
 from urllib.parse import urlparse
 
@@ -15,6 +18,59 @@ from newsgenie.tools.search import web_search
 from newsgenie.tools.trust import rank_sources
 
 log = logging.getLogger(__name__)
+
+
+def _parse_structured_response(raw: str) -> tuple[str, list[str]] | None:
+    """Parse a JSON response with shape: {answer_markdown: str, citations: list[str]}."""
+    candidates: list[str] = [raw.strip()]
+    fenced = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, flags=re.IGNORECASE)
+    candidates.extend(fenced)
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(raw[start : end + 1].strip())
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        answer = data.get("answer_markdown") or data.get("answer") or ""
+        if not isinstance(answer, str):
+            answer = str(answer)
+
+        raw_citations = data.get("citations")
+        citations = [str(url) for url in raw_citations] if isinstance(raw_citations, list) else []
+        return answer.strip(), citations
+
+    return None
+
+
+def _request_id(state: AgentState) -> str:
+    meta = state.setdefault("meta", {})
+    rid = meta.get("request_id")
+    if isinstance(rid, str) and rid:
+        return rid
+    rid = uuid.uuid4().hex[:12]
+    meta["request_id"] = rid
+    return rid
+
+
+def _mark_timing(state: AgentState, node_name: str, started_at: float) -> None:
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    meta = state.setdefault("meta", {})
+    timings = meta.get("timings_ms")
+    if not isinstance(timings, dict):
+        timings = {}
+        meta["timings_ms"] = timings
+    timings[node_name] = elapsed_ms
+    log.info("request_id=%s node=%s elapsed_ms=%.2f", _request_id(state), node_name, elapsed_ms)
 
 
 def _normalize_url(url: str) -> str:
@@ -84,29 +140,37 @@ def classify_intent(query: str, category: Category) -> IntentDecision:
 
 
 def node_ingest(state: AgentState) -> AgentState:
+    started = time.perf_counter()
     state["errors"] = state.get("errors", [])
     state["warnings"] = state.get("warnings", [])
     state["citations"] = []
     state["news_items"] = []
     state["search_items"] = []
     state["meta"] = state.get("meta", {})
+    _request_id(state)
+    _mark_timing(state, "ingest", started)
     return state
 
 
 def node_classify(state: AgentState) -> AgentState:
+    started = time.perf_counter()
     decision = classify_intent(state["user_query"], state["category"])
     state["decision"] = decision
     state["intent"] = decision["intent"]
     log.info(
-        "Classified intent=%s  category=%s  entities=%s",
+        "request_id=%s intent=%s category=%s entities=%s",
+        _request_id(state),
         decision["intent"],
         decision.get("category"),
         decision.get("entities", []),
     )
+    _mark_timing(state, "classify", started)
     return state
 
 
 def node_retrieve(state: AgentState) -> AgentState:
+    started = time.perf_counter()
+    request_id = _request_id(state)
     intent = state["intent"]
     category = state["category"]
     q = state["user_query"]
@@ -116,31 +180,34 @@ def node_retrieve(state: AgentState) -> AgentState:
     if use_news and intent in ("NEWS_CATEGORY", "NEWS_TOPIC", "MIXED", "FACT_CHECK"):
         topic = q if intent in ("NEWS_TOPIC", "FACT_CHECK") else None
         news_limit = state.get("news_limit") or 8
-        log.info("Fetching news  category=%s  topic=%s  limit=%d", category, topic, news_limit)
+        log.info("request_id=%s fetch_news category=%s topic=%s limit=%d", request_id, category, topic, news_limit)
         try:
             state["news_items"] = rank_sources(_safe_fetch_news(category, topic, limit=news_limit))
-            log.info("News returned %d items", len(state["news_items"]))
+            log.info("request_id=%s news_items=%d", request_id, len(state["news_items"]))
         except Exception as e:
-            log.warning("News fetch error: %s", e)
+            log.warning("request_id=%s news_fetch_error=%s", request_id, e)
             state["errors"].append(str(e))
     elif not use_news and intent in ("NEWS_CATEGORY", "NEWS_TOPIC", "MIXED", "FACT_CHECK"):
-        log.info("News API disabled by user — skipping")
+        log.info("request_id=%s news_api_disabled=true", request_id)
 
     if use_search and intent in ("FACT_CHECK", "MIXED"):
-        log.info("Running web search  query=%s", q)
+        log.info("request_id=%s web_search query=%s", request_id, q)
         try:
             state["search_items"] = rank_sources(web_search(q))
-            log.info("Web search returned %d items", len(state["search_items"]))
+            log.info("request_id=%s search_items=%d", request_id, len(state["search_items"]))
         except Exception as e:
-            log.warning("Web search error: %s", e)
+            log.warning("request_id=%s web_search_error=%s", request_id, e)
             state["errors"].append(str(e))
     elif not use_search and intent in ("FACT_CHECK", "MIXED"):
-        log.info("Web Search disabled by user — skipping")
+        log.info("request_id=%s web_search_disabled=true", request_id)
 
+    _mark_timing(state, "retrieve", started)
     return state
 
 
 def node_compose(state: AgentState) -> AgentState:
+    started = time.perf_counter()
+    request_id = _request_id(state)
     q = state["user_query"]
     news_items = state.get("news_items") or []
     search_items = state.get("search_items") or []
@@ -167,6 +234,12 @@ def node_compose(state: AgentState) -> AgentState:
         "Do NOT add a separate 'Sources' or 'Cited sources' section at the end — citations must be inline only."
     )
 
+    structured_output = (
+        "Return ONLY valid JSON (no prose, no code fences) with exactly these keys: "
+        "answer_markdown (string), citations (array of URLs). "
+        "Citations must be URLs from the provided sources that support the answer."
+    )
+
     # Build conversation context from recent history (last few turns)
     history = state.get("chat_history") or []
     history_block = ""
@@ -187,20 +260,33 @@ def node_compose(state: AgentState) -> AgentState:
             + history_block
             + "\nSources (use these; do not invent new facts):\n"
             + "\n".join(sources)
-            + "\n\nWrite a helpful response with inline citations as markdown links. Do NOT add a separate sources section at the end."
+            + "\n\nWrite a helpful response with inline citations as markdown links. "
+            + "Do NOT add a separate sources section at the end.\n"
+            + structured_output
         )
     else:
         prompt = (
             f"User query: {q}\n"
             + history_block
-            + "\nAnswer as best you can. If real-time facts are required, state what data is missing."
+            + "\nAnswer as best you can. If real-time facts are required, state what data is missing.\n"
+            + structured_output
         )
 
     try:
-        ans = chat(prompt, system=sys)
+        raw_response = chat(prompt, system=sys)
     except Exception as e:
         state["errors"].append(f"LLM call failed: {e}")
-        ans = "Sorry, I couldn't generate a response right now. Please try again."
+        raw_response = "Sorry, I couldn't generate a response right now. Please try again."
+        log.warning("request_id=%s llm_call_failed=%s", request_id, e)
+
+    parsed = _parse_structured_response(raw_response)
+    if parsed is not None:
+        ans, cited_urls = parsed
+        log.info("request_id=%s structured_response=true citations=%d", request_id, len(cited_urls))
+    else:
+        ans = raw_response
+        cited_urls = []
+        log.info("request_id=%s structured_response=false", request_id)
 
     # Strip any trailing "Cited sources" / "Sources" block the LLM might still add
     ans = re.sub(
@@ -223,14 +309,18 @@ def node_compose(state: AgentState) -> AgentState:
             _url_meta[norm] = {"outlet": it["outlet"], "title": it["title"], "kind": "MEMORY", "url": it["url"]}
 
     # Extract all URLs from the answer (markdown links or bare)
-    md_links = re.findall(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", ans)
-    if not md_links:
-        bare = re.findall(r"https?://\S+", ans)
-        md_links = [("", u.rstrip(").,]")) for u in bare]
+    url_candidates = cited_urls
+    if not url_candidates:
+        md_links = re.findall(r"\[[^\]]+\]\((https?://[^\s)]+)\)", ans)
+        if md_links:
+            url_candidates = md_links
+        else:
+            bare = re.findall(r"https?://\S+", ans)
+            url_candidates = [u.rstrip(").,]") for u in bare]
 
     seen: set[str] = set()
     enriched: list[str] = []
-    for _link_text, url in md_links:
+    for url in url_candidates:
         norm = _normalize_url(url)
         if norm in seen:
             continue
@@ -238,19 +328,21 @@ def node_compose(state: AgentState) -> AgentState:
         meta = _url_meta.get(norm)
         if meta:
             label = f"{meta['outlet']} — {meta['title']}"
-            tag = ' <span title="Recalled from earlier headlines">🧠</span>' if norm in memory_urls else ""
-            enriched.append(f"[{label}]({url}){tag}")
+            suffix = " (memory)" if norm in memory_urls else ""
+            enriched.append(f"[{label}]({url}){suffix}")
         else:
-            enriched.append(f"[{_link_text or url}]({url})")
+            enriched.append(f"[{url}]({url})")
 
     state["citations"] = enriched
     state["answer"] = ans
     if state["intent"] != "GENERAL_QA" and not state["citations"] and sources:
         state["warnings"].append("No citations detected; consider enforcing stricter citation checks.")
+    _mark_timing(state, "compose", started)
     return state
 
 
 def node_finalize(state: AgentState) -> AgentState:
+    started = time.perf_counter()
     footer: list[str] = []
     if state.get("warnings"):
         footer.append("Warnings: " + "; ".join(state["warnings"]))
@@ -258,6 +350,7 @@ def node_finalize(state: AgentState) -> AgentState:
         footer.append("Errors: " + "; ".join(state["errors"]))
     if footer:
         state["answer"] = state.get("answer", "") + "\n\n---\n" + "\n".join(footer)
+    _mark_timing(state, "finalize", started)
     return state
 
 

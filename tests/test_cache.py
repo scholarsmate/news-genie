@@ -33,3 +33,20 @@ def test_get_or_set_caches():
     assert c.get_or_set("k", factory) == "computed"
     assert c.get_or_set("k", factory) == "computed"
     assert len(calls) == 1, "Factory should only be called once"
+
+
+def test_max_entries_evicts_oldest():
+    c = TTLCache(60, max_entries=2)
+    c.set("a", 1)
+    c.set("b", 2)
+    c.set("c", 3)
+
+    assert c.get("a") is None
+    assert c.get("b") == 2
+    assert c.get("c") == 3
+
+
+def test_max_entries_zero_keeps_empty_cache():
+    c = TTLCache(60, max_entries=0)
+    c.set("a", 1)
+    assert c.get("a") is None

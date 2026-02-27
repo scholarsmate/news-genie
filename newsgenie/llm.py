@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import re
 
@@ -36,6 +37,8 @@ def _build_client() -> openai.OpenAI | openai.AzureOpenAI:
 def _demo_answer(prompt: str) -> str:
     """Generate a realistic-looking demo response by synthesizing any sources found in the prompt."""
 
+    wants_json = "Return ONLY valid JSON" in prompt
+
     # Extract source lines injected by node_compose
     source_lines = re.findall(r"\[(NEWS|WEB|MEMORY)\]\s*(.+)", prompt)
 
@@ -58,6 +61,8 @@ def _demo_answer(prompt: str) -> str:
         body = "Here's a summary based on the available sources:\n\n" + "\n".join(bullets)
 
         body += "\n\n---\n*This is a **demo-mode** response. Add API keys in `.env` to get live, real-time answers.*"
+        if wants_json:
+            return json.dumps({"answer_markdown": body, "citations": urls}, ensure_ascii=False)
         return body
 
     # General Q&A fallback (no sources)
@@ -65,7 +70,7 @@ def _demo_answer(prompt: str) -> str:
     query_match = re.search(r"User query:\s*(.+?)(?:\n|$)", prompt)
     user_query = query_match.group(1).strip() if query_match else prompt[:200]
 
-    return (
+    body = (
         f"Great question! Here's what I can tell you about **{user_query}**:\n\n"
         "In demo mode I don't have access to a live LLM, but in production NewsGenie would:\n"
         "1. Retrieve relevant news articles and web sources\n"
@@ -75,6 +80,9 @@ def _demo_answer(prompt: str) -> str:
         "---\n"
         "*Demo-mode response — no API keys configured.*"
     )
+    if wants_json:
+        return json.dumps({"answer_markdown": body, "citations": []}, ensure_ascii=False)
+    return body
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=1, max=8), reraise=True)

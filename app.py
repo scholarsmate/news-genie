@@ -220,7 +220,7 @@ for m in _messages():
         if m.get("sources"):
             with st.expander("Sources"):
                 for u in m["sources"]:
-                    st.markdown(f"- {u}", unsafe_allow_html=True)
+                    st.markdown(f"- {u}")
 
 prompt = st.chat_input("Ask a question, or request news updates…")
 if prompt:
@@ -254,6 +254,6 @@ if prompt:
         if sources:
             with st.expander("Sources"):
                 for u in sources:
-                    st.markdown(f"- {u}", unsafe_allow_html=True)
+                    st.markdown(f"- {u}")
 
     _messages().append({"role": "assistant", "content": out.get("answer", ""), "sources": sources})
