@@ -328,7 +328,7 @@ def node_compose(state: AgentState) -> AgentState:
         meta = _url_meta.get(norm)
         if meta:
             label = f"{meta['outlet']} — {meta['title']}"
-            suffix = " (memory)" if norm in memory_urls else ""
+            suffix = " 🧠" if norm in memory_urls else ""
             enriched.append(f"[{label}]({url}){suffix}")
         else:
             enriched.append(f"[{url}]({url})")

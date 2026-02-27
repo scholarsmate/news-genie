@@ -47,15 +47,12 @@ _CATEGORY_ICONS: dict[str, str] = {
 }
 
 with st.sidebar:
-    st.markdown(
-        "<div style='text-align:center;padding:0.5rem 0 0.25rem'>"
-        "<span style='font-size:2.4rem'>🧞‍♂️</span><br>"
-        "<span style='font-size:0.75rem;opacity:0.5'>NewsGenie</span>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("### 🧞‍♂️ NewsGenie")
+    st.caption("Your news + fact-check copilot")
+    st.divider()
 
-    st.markdown("##### 📰 News Options")
+    st.markdown("##### 📰 News")
+    st.caption("Pick a category and article depth")
     _categories = ["general", "entertainment", "finance", "politics", "sports", "technology"]
     category = st.selectbox(
         "Category",
@@ -80,6 +77,7 @@ with st.sidebar:
 
     # ── Service status ──
     st.markdown("##### ⚡ Services")
+    st.caption("Enable data sources for this session")
 
     _has_news = bool(SETTINGS.news_api_key) or SETTINGS.is_demo()
     _has_search = bool(SETTINGS.search_api_key and SETTINGS.search_api_base_url) or SETTINGS.is_demo()
@@ -122,25 +120,22 @@ with st.sidebar:
 
     st.divider()
     st.markdown("##### 💻 Session")
+    st.caption("Manage local chat state")
     if st.button("🗑️ Clear chat", use_container_width=True):
         st.session_state.pop("_cat_messages", None)
         st.session_state.pop("_last_category", None)
         st.session_state.pop("_news_memory", None)
+        st.session_state.pop("_pending_prompt", None)
         st.rerun()
-
-    # Footer
-    st.markdown(
-        f"<div style='position:fixed;bottom:0.75rem;font-size:0.7rem;opacity:0.4'>"
-        f"v{__version__}"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    st.caption(f"Version {__version__}")
 
 # ── Per-category message & memory stores ──
 if "_cat_messages" not in st.session_state:
     st.session_state["_cat_messages"] = {}  # category -> list[message]
 if "_news_memory" not in st.session_state:
     st.session_state["_news_memory"] = {}  # category -> list[SourceItem]
+if "_pending_prompt" not in st.session_state:
+    st.session_state["_pending_prompt"] = None
 
 
 def _messages() -> list[dict[str, Any]]:
@@ -152,6 +147,10 @@ def _messages() -> list[dict[str, Any]]:
 
 
 graph = _cached_graph()
+
+
+def _queue_prompt(text: str) -> None:
+    st.session_state["_pending_prompt"] = text
 
 
 def _build_init_state(
@@ -185,6 +184,35 @@ def _extract_sources(output: dict[str, Any]) -> list[str]:
     """Pull citation strings from graph output."""
     raw = output.get("citations")
     return [str(u) for u in cast(list[object], raw)] if isinstance(raw, list) else []
+
+
+def _render_status_strip() -> None:
+    """Render a compact status strip for context at a glance."""
+    memory_count = len(st.session_state.get("_news_memory", {}).get(category, []))
+    enabled_services = 1 + int(use_news) + int(use_search)  # LLM is always on
+    mode = "Demo" if SETTINGS.is_demo() else "Live"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Category", f"{_CATEGORY_ICONS.get(category, '')} {category.capitalize()}")
+    c2.metric("Mode", mode)
+    c3.metric("Services", f"{enabled_services}/3")
+    c4.metric("Memory", str(memory_count))
+
+
+def _render_quick_prompts() -> None:
+    """Render quick-prompt actions to make interaction feel snappier."""
+    st.markdown("##### ✨ Quick prompts")
+    q1, q2, q3 = st.columns(3)
+    if q1.button("📰 Top headlines", use_container_width=True):
+        _queue_prompt(f"Top {category} headlines right now")
+    if q2.button("🔄 What changed?", use_container_width=True):
+        _queue_prompt(f"What changed this week in {category}?")
+    if q3.button("✅ Fact-check trend", use_container_width=True):
+        _queue_prompt(f"Fact check the biggest {category} claim trending today")
+
+
+_render_status_strip()
+_render_quick_prompts()
 
 # ── Auto-load headlines when category changes ──
 _prev_cat = st.session_state.get("_last_category")
@@ -222,7 +250,14 @@ for m in _messages():
                 for u in m["sources"]:
                     st.markdown(f"- {u}")
 
+if not _messages():
+    st.info("Try a quick prompt above or ask anything from the chat input below.")
+
 prompt = st.chat_input("Ask a question, or request news updates…")
+queued_prompt = st.session_state.pop("_pending_prompt", None)
+if queued_prompt and not prompt:
+    prompt = str(queued_prompt)
+
 if prompt:
     _messages().append({"role": "user", "content": prompt})
     with st.chat_message("user"):
